@@ -1,0 +1,160 @@
+2. Split-half Reliability of Model Parameters (within participant)
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+from scipy.special import expit
+from scipy.stats import pearsonr
+
+# Settings
+DATA_PATH = "/Users/miru/Documents/PSYC 385 Thesis/Phase2_data (Raw Otto).csv"
+ALLOWED_P = {0.5, 0.9, 1.0}
+BOUNDS = [(0.0, 1.0), (0.0, 1.0), (0.0, 10.0)]   # alpha, beta bounded to [0, 1], mu goes beyond
+N_REPS = 100
+MIN_TRIALS = 50        
+RNG_SEED = 0
+
+# Load data 
+def load_phase2_df(path=DATA_PATH):
+    cols = ['PID', 'P_Gamble', 'A_Gamble', 'A_Certain', 'Gamble']
+    df = pd.read_csv(path, usecols=cols)
+    df['P_Gamble'] = pd.to_numeric(df['P_Gamble'], errors='coerce')
+    df = df[df['P_Gamble'].isin(ALLOWED_P)].reset_index(drop=True)
+    return df
+
+# load full dataframes
+cols = ['PID', 'P_Gamble', 'A_Gamble', 'A_Certain', 'Gamble']
+full_df = pd.read_csv(DATA_PATH, usecols=cols)
+full_df['P_Gamble'] = pd.to_numeric(full_df['P_Gamble'], errors='coerce')
+ 
+df = full_df[full_df['P_Gamble'].isin(ALLOWED_P)].reset_index(drop=True) 
+
+# scale payoffs so mu in [0,1] is sufficient
+payoff_scale = np.nanmax(np.concatenate([full_df['A_Gamble'].values, full_df['A_Certain'].values]))
+if payoff_scale is None or payoff_scale == 0 or not np.isfinite(payoff_scale):
+    payoff_scale = 1.0
+full_df['A_Gamble_scaled'] = full_df['A_Gamble'] / payoff_scale
+full_df['A_Certain_scaled'] = full_df['A_Certain'] / payoff_scale
+df['A_Gamble_scaled'] = df['A_Gamble'] / payoff_scale
+df['A_Certain_scaled'] = df['A_Certain'] / payoff_scale
+
+# Altered prospect theory model functions
+def subjective_values(p, A_g, A_c, alpha, beta): 
+    SV_r = (p ** (1 - beta)) * (A_g ** alpha) 
+    SV_c = (A_c ** alpha) 
+    return SV_r, SV_c  
+
+# negative log-likelihood
+def nll_joint(params, p, A_g, A_c, choices):
+    alpha, beta, mu = params
+    SV_r, SV_c = subjective_values(p, A_g, A_c, alpha, beta)
+    dSV = SV_r - SV_c
+    p_gamble = expit(mu * dSV)
+    p_gamble = np.clip(p_gamble, 1e-9, 1 - 1e-9)
+    return -np.sum(choices * np.log(p_gamble) + (1 - choices) * np.log(1 - p_gamble))
+
+# safe fitting function
+def fit_safe(p_sub, Ag_sub, Ac_sub, choices_sub, x0=(0.5, 0.5, 0.5), bounds=BOUNDS):
+    try:
+        res = minimize(nll_joint, x0=x0, args=(p_sub, Ag_sub, Ac_sub, choices_sub),
+                       bounds=bounds, method="L-BFGS-B", options={"maxiter":1000})
+        if res.success and np.all(np.isfinite(res.x)): 
+            return np.array(res.x, dtype=float)
+    except Exception:
+        pass
+    return np.array([np.nan, np.nan, np.nan], dtype=float)
+
+rng = np.random.default_rng(RNG_SEED) # random number generator
+
+# preparet to collect per-participant mean-half parameters
+pids = []
+alpha_half1_means = []
+alpha_half2_means = []
+beta_half1_means = []
+beta_half2_means = []
+mu_half1_means = []
+mu_half2_means = []
+
+for pid, sub in df.groupby("PID"): # iterate per participant
+    n = len(sub) 
+    if n < MIN_TRIALS:
+        continue
+
+    # get all data for this participant
+    p_all = sub["P_Gamble"].values 
+    Ag_all = sub["A_Gamble_scaled"].values 
+    Ac_all = sub["A_Certain_scaled"].values
+    choices_all = sub["Gamble"].astype(int).values # all choices as 0/1
+
+    a1_list, a2_list = [], []
+    b1_list, b2_list = [], []
+    m1_list, m2_list = [], []
+
+    for _ in range(N_REPS): # repeat N_REPS times
+        perm = rng.permutation(n) # shuffle trials
+        half = n // 2 
+        if half < 2:
+            break
+        idx1 = perm[:half] 
+        idx2 = perm[half:half+half]
+
+        r1 = fit_safe(p_all[idx1], Ag_all[idx1], Ac_all[idx1], choices_all[idx1]) # fit half 1
+        r2 = fit_safe(p_all[idx2], Ag_all[idx2], Ac_all[idx2], choices_all[idx2]) # fit half 2
+
+        a1_list.append(r1[0]); b1_list.append(r1[1]); m1_list.append(r1[2]) 
+        a2_list.append(r2[0]); b2_list.append(r2[1]); m2_list.append(r2[2])
+
+    # compute mean across repeats (ignore NaNs)
+    a1m = np.nanmean(a1_list) if np.any(np.isfinite(a1_list)) else np.nan
+    a2m = np.nanmean(a2_list) if np.any(np.isfinite(a2_list)) else np.nan
+    b1m = np.nanmean(b1_list) if np.any(np.isfinite(b1_list)) else np.nan
+    b2m = np.nanmean(b2_list) if np.any(np.isfinite(b2_list)) else np.nan
+    m1m = np.nanmean(m1_list) if np.any(np.isfinite(m1_list)) else np.nan
+    m2m = np.nanmean(m2_list) if np.any(np.isfinite(m2_list)) else np.nan
+
+    # require that both halves produced at least one finite fit for this participant
+    if not (np.isfinite(a1m) and np.isfinite(a2m)): 
+        continue
+
+    # store results
+    pids.append(pid) # per participant ID
+    alpha_half1_means.append(a1m); alpha_half2_means.append(a2m) # store alphas
+    beta_half1_means.append(b1m);  beta_half2_means.append(b2m) # store betas
+    mu_half1_means.append(m1m);    mu_half2_means.append(m2m)  # store mus
+
+# assemble dataframe
+summary = pd.DataFrame({
+    "PID": pids,
+    "alpha_h1": alpha_half1_means, "alpha_h2": alpha_half2_means,
+    "beta_h1":  beta_half1_means,  "beta_h2":  beta_half2_means,
+    "mu_h1":    mu_half1_means,    "mu_h2":    mu_half2_means
+})
+
+# PLOT 1: Split-Half Reliability (scatter plots with correlations)
+def scatter_and_corr(x, y, xlabel, ylabel, title): # scatter plot and compute correlation
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 2:
+        print("Not enough data to compute correlation for", title)
+        return
+    r, pval = pearsonr(x[mask], y[mask]) # compute Pearson correlation 
+    fig, ax = plt.subplots(figsize=(6,6))
+    ax.scatter(x[mask], y[mask], s=40, edgecolor='k', alpha=0.8)
+    mn = min(np.nanmin(x[mask]), np.nanmin(y[mask])); mx = max(np.nanmax(x[mask]), np.nanmax(y[mask]))
+    pad = 0.05 * (mx - mn) if mx>mn else 0.1
+    ax.plot([mn-pad, mx+pad], [mn-pad, mx+pad], color='gray', linestyle='--')
+    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    ax.set_title(f"{title}\nPearson r={r:.3f}, p={pval:.3g}")
+    ax.grid(alpha=0.12)
+    plt.tight_layout()
+    plt.show()
+    print(f"{title} — r={r:.4f}, p={pval:.4g}, n={mask.sum()}")
+
+
+scatter_and_corr(summary["alpha_h1"].values, summary["alpha_h2"].values, "Alpha (Half 1)", "Alpha (Half 2)", "Alpha: Half1 vs Half2")
+scatter_and_corr(summary["beta_h1"].values,  summary["beta_h2"].values,  "Beta (Half 1)",  "Beta (Half 2)",  "Beta: Half1 vs Half2")
+scatter_and_corr(summary["mu_h1"].values,    summary["mu_h2"].values,    "Mu (Half 1)",    "Mu (Half 2)",    "Mu: Half1 vs Half2")
+
+# save 
+summary.to_csv("/Users/miru/Documents/PSYC 385 Thesis/split_half_param_means_per_pid.csv", index=False)
+#_
